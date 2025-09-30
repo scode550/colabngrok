@@ -1,105 +1,137 @@
 import os
-import uvicorn
-from fastapi import FastAPI, File, UploadFile, HTTPException
+import uuid
+from fastapi import FastAPI, UploadFile, File, HTTPException, Body
 from fastapi.middleware.cors import CORSMiddleware
-import logging
+from typing import List, Dict, Any
 
-from models import ChatRequest, UploadResponse, ChatResponse
 from document_processor import process_document
-from vector_store import VectorStore
 from rag_pipeline import RAGPipeline
+from vector_store import VectorStore
+from models import UploadResponse, ChatRequest, ChatResponse, ChatMessage, SessionHistory, SessionSummary
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+app = FastAPI()
 
-# Initialize FastAPI app
-app = FastAPI(
-    title="Multi-Stakeholder RAG Chatbot API",
-    description="API for uploading documents and chatting with them based on stakeholder roles.",
-    version="1.0.0"
-)
-
-# CORS (Cross-Origin Resource Sharing) middleware
+# --- CORS Middleware ---
+# Allows the frontend to communicate with this backend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allows all origins
+    allow_origins=["*"],
     allow_credentials=True,
-    allow_methods=["*"],  # Allows all methods
-    allow_headers=["*"],  # Allows all headers
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
-# --- Globals ---
-# In a real-world scenario, you'd use a more persistent storage solution.
-# For this project, we'll store the vector store in memory/local file.
-DATA_DIR = "data"
-if not os.path.exists(DATA_DIR):
-    os.makedirs(DATA_DIR)
+# --- In-Memory Session Storage ---
+# In a production environment, this would be a database (e.g., Redis, PostgreSQL)
+SESSIONS: Dict[str, Dict[str, Any]] = {}
 
-vector_store = VectorStore(data_dir=DATA_DIR)
-rag_pipeline = RAGPipeline(vector_store)
-# --- End Globals ---
-
-@app.get("/", tags=["Status"])
-async def read_root():
-    """Root endpoint to check API status."""
-    return {"status": "API is running"}
-
-@app.post("/upload", response_model=UploadResponse, tags=["Document Handling"])
-async def upload_document(file: UploadFile = File(...)):
-    """
-    Endpoint to upload a document (PDF).
-    The document is processed, chunked, and stored in the vector database.
-    """
-    if file.content_type != 'application/pdf':
-        raise HTTPException(status_code=400, detail="Invalid file type. Only PDF is supported.")
+# --- Helper Function to Get or Create Session ---
+def get_or_create_session(session_id: str = None, role: str = None) -> Dict[str, Any]:
+    if session_id and session_id in SESSIONS:
+        return SESSIONS[session_id]
     
-    try:
-        file_path = os.path.join(DATA_DIR, file.filename)
-        # Save the file temporarily
-        with open(file_path, "wb") as buffer:
-            buffer.write(await file.read())
-        
-        logger.info(f"Processing document: {file.filename}")
-        chunks = process_document(file_path)
-        
-        # Add chunks to the vector store
-        vector_store.add_documents(chunks, file.filename)
-        logger.info(f"Successfully processed and indexed {len(chunks)} chunks from {file.filename}.")
+    if not role:
+        raise HTTPException(status_code=400, detail="Role is required to create a new session.")
 
-        # Clean up the saved file
-        os.remove(file_path)
+    new_session_id = str(uuid.uuid4())
+    print(f"Creating new session {new_session_id} for role {role}")
+    
+    vector_store = VectorStore(f"faiss_index_{new_session_id}")
+    rag_pipeline = RAGPipeline(vector_store)
+    
+    SESSIONS[new_session_id] = {
+        "session_id": new_session_id,
+        "rag_pipeline": rag_pipeline,
+        "role": role,
+        "history": [],
+        "filenames": []
+    }
+    return SESSIONS[new_session_id]
 
-        return {"filename": file.filename, "message": f"Successfully uploaded and processed."}
-    except Exception as e:
-        logger.error(f"Error processing file {file.filename}: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to process document: {str(e)}")
-
-
-@app.post("/chat", response_model=ChatResponse, tags=["Chatbot"])
-async def chat_with_document(request: ChatRequest):
+# --- API Endpoints ---
+@app.post("/upload", response_model=UploadResponse)
+async def upload_files(
+    files: List[UploadFile] = File(...),
+    session_id: str = Body(None),
+    role: str = Body(...)
+):
     """
-    Endpoint to handle chat queries.
-    It takes a user query and their role, then returns a context-aware answer.
+    Handles file uploads, creates a new session if one doesn't exist,
+    processes documents, and adds them to the session's vector store.
     """
-    if not request.query:
-        raise HTTPException(status_code=400, detail="Query cannot be empty.")
-    if not request.role:
-        raise HTTPException(status_code=400, detail="Role must be specified.")
-        
-    try:
-        logger.info(f"Received query: '{request.query}' for role: '{request.role}'")
-        answer, sources, confidence = rag_pipeline.answer_query(request.query, request.role)
-        
-        return ChatResponse(
-            answer=answer,
-            sources=sources,
-            confidence_score=confidence
-        )
-    except Exception as e:
-        logger.error(f"Error during chat processing: {e}")
-        raise HTTPException(status_code=500, detail=f"An error occurred while generating a response: {str(e)}")
+    session = get_or_create_session(session_id, role)
+    current_session_id = session["session_id"]
+    
+    processed_filenames = []
+    for file in files:
+        file_location = f"temp_{file.filename}"
+        with open(file_location, "wb+") as file_object:
+            file_object.write(file.file.read())
 
-# To run this app: uvicorn main:app --reload
-if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+        chunks = process_document(file_location, file.filename)
+        session["rag_pipeline"].vector_store.add_documents(chunks)
+        
+        session["filenames"].append(file.filename)
+        processed_filenames.append(file.filename)
+        os.remove(file_location)
+        
+    session["filenames"] = list(set(session["filenames"])) # Keep unique names
+
+    return UploadResponse(
+        session_id=current_session_id,
+        message=f"Successfully processed {len(processed_filenames)} files.",
+        filenames=session["filenames"]
+    )
+
+@app.post("/chat", response_model=ChatResponse)
+async def chat_with_bot(request: ChatRequest):
+    """
+    Handles a chat query for a specific session.
+    """
+    if request.session_id not in SESSIONS:
+        raise HTTPException(status_code=404, detail="Session not found.")
+    
+    session = SESSIONS[request.session_id]
+    
+    # Add user message to history
+    session["history"].append(ChatMessage(sender="user", content=request.query, sources=[]))
+
+    # Get AI response
+    answer, sources, confidence = session["rag_pipeline"].answer_query(request.query, session["role"])
+    
+    ai_message = ChatMessage(sender="ai", content=answer, sources=sources)
+    session["history"].append(ai_message)
+
+    return ChatResponse(session_id=request.session_id, response=ai_message)
+
+@app.get("/sessions/list", response_model=List[SessionSummary])
+async def list_sessions():
+    """
+    Returns a list of all active sessions with a title.
+    """
+    summaries = []
+    for session_id, session_data in SESSIONS.items():
+        if session_data["history"]:
+            # Use the first user message as the title
+            title = session_data["history"][0].content
+        else:
+            title = "New Chat" # Or based on uploaded files
+        
+        summaries.append(SessionSummary(session_id=session_id, title=title[:50])) # Truncate title
+    return summaries
+
+@app.get("/sessions/{session_id}", response_model=SessionHistory)
+async def get_session_history(session_id: str):
+    """
+    Retrieves the full history for a given session.
+    """
+    if session_id not in SESSIONS:
+        raise HTTPException(status_code=404, detail="Session not found.")
+    
+    session = SESSIONS[session_id]
+    return SessionHistory(
+        session_id=session_id,
+        role=session["role"],
+        messages=session["history"]
+    )
+
