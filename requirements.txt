@@ -10,5 +10,6 @@ pydantic
 python-jose[cryptography]
 passlib[bcrypt]
 pdfplumber
+PyPDF2
 sentencepiece
 accelerate
