@@ -1,5 +1,5 @@
 from transformers import pipeline
-from .vector_store import VectorStore
+from vector_store import VectorStore  # <-- CORRECTED THIS LINE
 import logging
 
 logger = logging.getLogger(__name__)
@@ -59,3 +59,4 @@ class RAGPipeline:
         logger.info(f"Generated answer with confidence: {confidence}")
 
         return answer, sources, confidence
+
