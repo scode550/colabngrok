@@ -1,97 +1,124 @@
-from transformers import pipeline
+from transformers import pipeline, Pipeline
 from vector_store import VectorStore
 import logging
 
+# Set up a specific logger for this module
 logger = logging.getLogger(__name__)
 
 class RAGPipeline:
-    """Implements a multi-stage Extract-and-Enhance pipeline."""
+    """
+    Implements a robust, state-less, multi-stage RAG pipeline.
+    The models are loaded on initialization, and the pipeline can then be
+    used for any number of queries without reloading.
+    """
 
-    def __init__(self, vector_store: VectorStore):
-        self.vector_store = vector_store
-        
-        # --- Model Loading ---
-        # 1. Extractive QA Model (Ground Truth)
-        qa_model_name = 'deepset/roberta-base-squad2'
-        logger.info(f"Loading Extractive QA model: {qa_model_name}")
-        self.qa_pipeline = pipeline("question-answering", model=qa_model_name, tokenizer=qa_model_name)
+    def __init__(self):
+        """
+        Initializes the pipeline and loads all required models.
+        This is a heavy operation and should only be done once.
+        """
+        logger.info("Initializing RAG Pipeline and loading models...")
+        try:
+            self.qa_pipeline: Pipeline = pipeline("question-answering", model='deepset/roberta-base-squad2')
+            self.ner_pipeline: Pipeline = pipeline("ner", model='Jean-Baptiste/roberta-large-ner-english', grouped_entities=True)
+            self.enhancer_pipeline: Pipeline = pipeline("text2text-generation", model='google/flan-t5-base')
+            logger.info("All models loaded successfully.")
+        except Exception as e:
+            logger.error(f"Failed to load one or more models: {e}")
+            raise
 
-        # 2. Named Entity Recognition Model (Contextual Analysis)
-        ner_model_name = 'Jean-Baptiste/roberta-large-ner-english'
-        logger.info(f"Loading NER model: {ner_model_name}")
-        self.ner_pipeline = pipeline("ner", model=ner_model_name, tokenizer=ner_model_name, grouped_entities=True)
-
-        # 3. Generative Enhancer Model (Fluency and Formatting)
-        enhancer_model_name = 'google/flan-t5-base'
-        logger.info(f"Loading Generative Enhancer model: {enhancer_model_name}")
-        self.enhancer_pipeline = pipeline("text2text-generation", model=enhancer_model_name, tokenizer=enhancer_model_name)
-
-        # --- Role-to-Entity Mapping ---
-        # Defines which NER entity types are most relevant for each stakeholder role
+        # Mapping of roles to the NER entity types they care about.
         self.ROLE_ENTITY_MAPPING = {
             "Product Lead": ["ORG", "DATE", "MONEY", "PERCENT", "PRODUCT"],
             "Tech Lead": ["ORG", "PRODUCT", "DATE", "CARDINAL", "QUANTITY"],
             "Compliance Lead": ["PERSON", "ORG", "GPE", "LAW", "DATE", "MONEY"],
             "Bank Alliance Lead": ["ORG", "LAW", "DATE", "PERCENT", "GPE"]
         }
+        
+        # Keywords to detect if the user is requesting a synthetic task (e.g., summarization).
+        self.TASK_KEYWORDS = ["list", "summarize", "extract", "show me all", "what are all", "find all"]
 
-    def answer_query(self, query: str, role: str) -> (str, list[str], float):
+    def _is_task_oriented(self, query: str) -> bool:
+        """Checks if a query is task-oriented based on keywords."""
+        return any(keyword in query.lower() for keyword in self.TASK_KEYWORDS)
+
+    def answer_query(self, query: str, role: str, vector_store: VectorStore) -> (str, list[str], float):
         """
-        Answers a query using the multi-stage Extract-and-Enhance pipeline.
+        Answers a query using a multi-stage process. This method is state-less
+        and depends on the provided vector_store for context.
         """
-        # === 1. RETRIEVE ===
-        logger.info(f"Performing semantic search for query: '{query}'")
-        retrieved_docs = self.vector_store.search(query, k=3)
+        logger.info(f"Processing query: '{query}' for role: '{role}'")
+        
+        # --- 1. RETRIEVE relevant document chunks ---
+        k_docs = 5 if self._is_task_oriented(query) else 3
+        retrieved_docs = vector_store.search(query, k=k_docs)
         if not retrieved_docs:
-            return "I couldn't find any relevant information in the uploaded documents.", [], 0.0
+            logger.warning("No relevant documents found in vector store for the query.")
+            return "I couldn't find any relevant information in the uploaded documents to answer your question.", [], 0.0
 
         context = " ".join([doc['content'] for doc in retrieved_docs])
-        sources = list(set([doc['source'] for doc in retrieved_docs])) # Use set for unique sources
+        sources = sorted(list(set([doc['source'] for doc in retrieved_docs])))
 
-        # === 2. EXTRACT (Get Ground Truth with RoBERTa) ===
-        logger.info("Extracting raw answer with RoBERTa...")
-        qa_input = {'question': query, 'context': context}
-        result = self.qa_pipeline(qa_input)
-        raw_answer = result['answer']
-        confidence = result['score']
+        try:
+            # --- 2. DETECT query type and EXECUTE appropriate pipeline ---
+            if self._is_task_oriented(query):
+                logger.info("Query detected as TASK-ORIENTED. Using generative task prompt.")
+                prompt = f"""
+                Based ONLY on the following context, perform the requested task. Be concise.
+                If the context is insufficient to perform the task, state that clearly.
 
-        if confidence < 0.2: # Low confidence threshold
-            return "I found some related information but could not determine a precise answer.", sources, confidence
+                Context:
+                "{context}"
 
-        # === 3. ANALYZE (Run NER on the Context) ===
-        logger.info("Analyzing context with NER model...")
-        ner_results = self.ner_pipeline(context)
+                Task: "{query}"
 
-        # === 4. FILTER (Select Role-Relevant Entities) ===
-        relevant_entity_types = self.ROLE_ENTITY_MAPPING.get(role, [])
-        role_specific_entities = [
-            f"{entity['word']} ({entity['entity_group']})" 
-            for entity in ner_results 
-            if entity['entity_group'] in relevant_entity_types
-        ]
-        # Remove duplicates
-        role_specific_entities = list(set(role_specific_entities))
-        
-        logger.info(f"Found relevant entities for role '{role}': {role_specific_entities}")
-        key_entities_str = ", ".join(role_specific_entities) if role_specific_entities else "None"
+                Result:
+                """
+                task_result = self.enhancer_pipeline(prompt, max_length=512, clean_up_tokenization_spaces=True)
+                final_answer = task_result[0]['generated_text']
+                confidence = 0.95 # Confidence is high as it's a generative task
+                
+            else:
+                logger.info("Query detected as Q&A. Using Extract-and-Enhance pipeline.")
+                
+                # --- Stage 1: EXTRACT a direct answer ---
+                qa_input = {'question': query, 'context': context}
+                result = self.qa_pipeline(qa_input)
+                raw_answer = result['answer']
+                confidence = result['score']
 
-        # === 5. ENHANCE (Polish the Answer with T5) ===
-        logger.info("Enhancing answer with Flan-T5...")
-        prompt = f"""
-        Rephrase the following "Raw Answer" into a professional, complete sentence.
-        Strictly use the information from the "Raw Answer" and the "Key Entities".
-        DO NOT add any new information. Your goal is to make the answer fluent and grounded.
+                if confidence < 0.15: # Increased threshold slightly
+                    logger.warning(f"Low confidence ({confidence:.2f}) for query. Returning generic response.")
+                    return "I found some related information, but I am not confident enough to provide a precise answer. You may want to rephrase your question.", sources, confidence
 
-        Key Entities: {key_entities_str}
-        Raw Answer: {raw_answer}
+                # --- Stage 2: ANALYZE for key entities ---
+                ner_results = self.ner_pipeline(context)
+                relevant_entity_types = self.ROLE_ENTITY_MAPPING.get(role, [])
+                role_specific_entities = list(set([
+                    f"{entity['word']} ({entity['entity_group']})" 
+                    for entity in ner_results 
+                    if entity['entity_group'] in relevant_entity_types
+                ]))
+                key_entities_str = ", ".join(role_specific_entities) if role_specific_entities else "None provided"
 
-        Polished Answer:
-        """
-        
-        generated_text = self.enhancer_pipeline(prompt, max_length=256, clean_up_tokenization_spaces=True)
-        final_answer = generated_text[0]['generated_text']
+                # --- Stage 3: ENHANCE the answer with context ---
+                prompt = f"""
+                Rephrase the following "Raw Answer" into a professional, standalone sentence.
+                Use ONLY the information from the "Raw Answer". You may reference the "Key Entities" for context.
+                Do not add any new information. Your response must be concise.
 
-        logger.info(f"Final polished answer: {final_answer}")
-        
+                Key Entities: {key_entities_str}
+                Raw Answer: {raw_answer}
+
+                Polished Answer:
+                """
+                generated_text = self.enhancer_pipeline(prompt, max_length=256, clean_up_tokenization_spaces=True)
+                final_answer = generated_text[0]['generated_text']
+
+        except Exception as e:
+            logger.error(f"An error occurred during model inference: {e}")
+            return "I encountered an error while processing your request. Please try again.", [], 0.0
+
+        logger.info(f"Final answer generated: {final_answer}")
         return final_answer, sources, confidence
 
