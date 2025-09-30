@@ -1,7 +1,6 @@
 fastapi
 uvicorn[standard]
 python-multipart
-pypdf2
 langchain
 sentence-transformers
 faiss-cpu
@@ -10,3 +9,6 @@ torch
 pydantic
 python-jose[cryptography]
 passlib[bcrypt]
+pdfplumber
+sentencepiece
+accelerate
